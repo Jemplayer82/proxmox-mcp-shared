@@ -1,3 +1,7 @@
 target/
 .git/
+.github/
 .env
+logs/
+*.log
+config.toml

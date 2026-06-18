@@ -1,6 +1,6 @@
+# syntax=docker/dockerfile:1
+# ---- Build the Rust binary (cargo-chef gives cached dependency layers) ----
 FROM rust:latest AS chef
-# We only pay the installation cost once,
-# it will be cached from the second build onwards
 RUN cargo install cargo-chef
 WORKDIR /app
 
@@ -10,14 +10,28 @@ RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
 COPY --from=planner /app/recipe.json recipe.json
-# Build dependencies - this is the caching Docker layer!
+# Build dependencies first - this layer is cached until Cargo.toml/lock change.
 RUN cargo chef cook --release --recipe-path recipe.json
-# Build application
 COPY . .
 RUN cargo build --release --bin proxmox-mcp-rs
 
-# We do not need the Rust toolchain to run the binary!
-FROM gcr.io/distroless/cc-debian12 AS runtime
+# ---- Runtime: wrap the stdio MCP binary in supergateway -> streamable HTTP ----
+# The upstream image ships a pure-stdio binary on distroless. For the shared
+# mcp-shared stack we instead expose streamable HTTP on /mcp (port 8000), the
+# same convention every other service in that stack uses (see mcp-portainer).
+# supergateway spawns the binary and bridges stdio <-> streamable HTTP; the
+# container environment (PROXMOX_*) is inherited by the child process.
+FROM node:20-bookworm-slim AS runtime
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g supergateway \
+    && npm cache clean --force
 WORKDIR /app
 COPY --from=builder /app/target/release/proxmox-mcp-rs /app/proxmox-mcp-rs
-ENTRYPOINT ["/app/proxmox-mcp-rs"]
+
+# Force stdio so supergateway owns the transport (not the binary's native SSE).
+ENV PROXMOX_SERVER_TYPE=stdio
+EXPOSE 8000
+
+ENTRYPOINT ["sh", "-c", "exec supergateway --outputTransport streamableHttp --port 8000 --stdio /app/proxmox-mcp-rs"]
