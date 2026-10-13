@@ -99,8 +99,10 @@ fn huge_health_word_is_shortened() {
 }
 
 #[test]
-fn check_messages_of_four_byte_characters_are_cut_by_characters() {
-    // Each message is 300 flames (4 bytes each). Cut at 120 characters, not bytes.
+fn check_messages_of_four_byte_characters_are_cut_by_serialized_bytes() {
+    // Each message is 300 flames (4 bytes each). Since fix round 3 the cut is
+    // by serialized JSON bytes, not characters: 120 bytes is 30 flames, plus
+    // the 3-byte ellipsis.
     let mut m = serde_json::Map::new();
     for i in 0..30 {
         m.insert(
@@ -116,9 +118,11 @@ fn check_messages_of_four_byte_characters_are_cut_by_characters() {
         "answer is {} bytes",
         size(&v)
     );
+    assert!(!v["checks"].as_array().unwrap().is_empty());
     for c in v["checks"].as_array().unwrap() {
         let s = c["summary"].as_str().unwrap();
-        assert_eq!(s.chars().count(), 121, "120 flames plus the ellipsis");
+        assert_eq!(s.chars().count(), 31, "30 flames plus the ellipsis");
+        assert_eq!(serde_json::to_string(s).unwrap().len() - 2, 123);
     }
 }
 
