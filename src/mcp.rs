@@ -1971,8 +1971,7 @@ impl McpServer {
                 "/cluster/ceph/status".to_string(),
             ),
         };
-        let mut summary = summarize_ceph_status(&s);
-        summary["source"] = json!(source);
+        let summary = summarize_ceph_status_from(&s, Some(&source));
         Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&summary)? }] }))
     }
 
@@ -2628,24 +2627,69 @@ pub fn flatten_ceph_osds(v: &Value) -> Result<Value> {
     }
 }
 
+/// Longest `get_ceph_health` answer, in bytes, with `source` filled in.
+pub const CEPH_HEALTH_MAX_BYTES: usize = 1024;
+/// Longest check message kept, in characters; longer ones end in "…".
+const CEPH_CHECK_MESSAGE_MAX_CHARS: usize = 120;
+
+fn ceph_severity_rank(severity: Option<&str>) -> u8 {
+    match severity {
+        Some("HEALTH_ERR") => 0,
+        Some("HEALTH_WARN") => 1,
+        _ => 2,
+    }
+}
+
+/// Removes keys whose value is null from an object and its nested objects, so
+/// a field Proxmox did not send is left out (it still reads as null).
+fn drop_null_fields(v: &mut Value) {
+    if let Value::Object(m) = v {
+        m.retain(|_, v| !v.is_null());
+        m.values_mut().for_each(drop_null_fields);
+    }
+}
+
 /// Cuts Proxmox's Ceph status (about 120 KB with the mgr module catalogue)
-/// down to the health word, warnings and counts. Missing fields become null.
+/// down to the health word, warnings and counts. Fields Proxmox did not send
+/// are left out, so they read as null. The answer stays within
+/// `CEPH_HEALTH_MAX_BYTES`: checks are listed most severe first, each message
+/// is shortened, and `checks_omitted` counts the checks that did not fit. The
+/// status line and counts are always present.
 pub fn summarize_ceph_status(s: &Value) -> Value {
-    let checks: Vec<Value> = s
+    summarize_ceph_status_from(s, None)
+}
+
+/// `summarize_ceph_status` with the `source` path included in the size cap.
+pub fn summarize_ceph_status_from(s: &Value, source: Option<&str>) -> Value {
+    let mut checks: Vec<Value> = s
         .pointer("/health/checks")
         .and_then(|c| c.as_object())
         .map(|m| {
             m.iter()
                 .map(|(name, c)| {
+                    let summary =
+                        c.pointer("/summary/message")
+                            .and_then(|v| v.as_str())
+                            .map(|msg| {
+                                if msg.chars().count() > CEPH_CHECK_MESSAGE_MAX_CHARS {
+                                    let short: String =
+                                        msg.chars().take(CEPH_CHECK_MESSAGE_MAX_CHARS).collect();
+                                    format!("{}…", short)
+                                } else {
+                                    msg.to_string()
+                                }
+                            });
                     json!({
                         "name": name,
                         "severity": c.get("severity"),
-                        "summary": c.pointer("/summary/message"),
+                        "summary": summary,
                     })
                 })
                 .collect()
         })
         .unwrap_or_default();
+    // Stable sort: HEALTH_ERR first, then HEALTH_WARN, names stay alphabetical within a level.
+    checks.sort_by_key(|c| ceph_severity_rank(c.get("severity").and_then(|v| v.as_str())));
     let quorum = s.get("quorum_names").and_then(|q| q.as_array());
     // Ceph Octopus+ puts the counts directly in osdmap; older ones nest osdmap.osdmap.
     let osdmap = match s.pointer("/osdmap/osdmap") {
@@ -2675,9 +2719,13 @@ pub fn summarize_ceph_status(s: &Value) -> Value {
         (Some(u), Some(t)) if t > 0.0 => json!((u / t * 1000.0).round() / 10.0),
         _ => Value::Null,
     };
-    json!({
+    let total_checks = checks.len();
+    // Measure the answer with no checks and the largest possible omitted count,
+    // then add checks while the serialized answer still fits.
+    let mut out = json!({
         "health": s.pointer("/health/status"),
-        "checks": checks,
+        "checks": [],
+        "checks_omitted": total_checks,
         "monitors": {
             "quorum": quorum,
             "count": quorum.map(|q| q.len()),
@@ -2696,6 +2744,22 @@ pub fn summarize_ceph_status(s: &Value) -> Value {
             "bytes_total": pgmap.get("bytes_total"),
             "percent_used": percent,
         },
-        "source": null,
-    })
+        "source": source,
+    });
+    drop_null_fields(&mut out);
+    let mut size = serde_json::to_string(&out).map(|t| t.len()).unwrap_or(0);
+    let mut kept = Vec::new();
+    for mut c in checks {
+        drop_null_fields(&mut c);
+        let n =
+            serde_json::to_string(&c).map(|t| t.len()).unwrap_or(0) + usize::from(!kept.is_empty());
+        if size + n > CEPH_HEALTH_MAX_BYTES {
+            break;
+        }
+        size += n;
+        kept.push(c);
+    }
+    out["checks_omitted"] = json!(total_checks - kept.len());
+    out["checks"] = Value::Array(kept);
+    out
 }
