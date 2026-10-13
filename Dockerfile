@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # ---- Build the Rust binary (cargo-chef gives cached dependency layers) ----
-FROM rust:latest AS chef
-RUN cargo install cargo-chef
+FROM rust:1.99.0-bookworm AS chef
+RUN cargo install cargo-chef --locked --version 0.1.78
 WORKDIR /app
 
 FROM chef AS planner
@@ -21,11 +21,11 @@ RUN cargo build --release --bin proxmox-mcp-rs
 # same convention every other service in that stack uses (see mcp-portainer).
 # supergateway spawns the binary and bridges stdio <-> streamable HTTP; the
 # container environment (PROXMOX_*) is inherited by the child process.
-FROM node:20-bookworm-slim AS runtime
+FROM node:20.20.2-bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g supergateway \
+    && npm install -g supergateway@3.4.3 \
     && npm cache clean --force
 WORKDIR /app
 COPY --from=builder /app/target/release/proxmox-mcp-rs /app/proxmox-mcp-rs
