@@ -349,6 +349,7 @@ impl McpServer {
             "list_ceph_pools" => self.handle_list_ceph_pools(args).await,
             "list_ceph_osds" => self.handle_list_ceph_osds(args).await,
             "list_ceph_monitors" => self.handle_list_ceph_monitors(args).await,
+            "get_ceph_health" => self.handle_get_ceph_health(args).await,
             "list_backup_schedules" => self.handle_list_backup_schedules(args).await,
             "list_repositories" => self.handle_list_repositories(args).await,
             "bulk_vm_action" => self.handle_bulk_vm_action(args).await,
@@ -498,6 +499,7 @@ impl McpServer {
             json!({"name": "list_ceph_pools", "description": "List pools (Ceph)", "inputSchema": {"type": "object", "properties": {"node": {"type": "string"}}, "required": ["node"]}}),
             json!({"name": "list_ceph_osds", "description": "List OSDs", "inputSchema": {"type": "object", "properties": {"node": {"type": "string"}}, "required": ["node"]}}),
             json!({"name": "list_ceph_monitors", "description": "List monitors", "inputSchema": {"type": "object", "properties": {"node": {"type": "string"}}, "required": ["node"]}}),
+            json!({"name": "get_ceph_health", "description": "Ceph health summary, read-only: HEALTH_OK/WARN/ERR, warnings, monitors, OSDs, placement groups, usage", "inputSchema": {"type": "object", "properties": {"node": {"type": "string", "description": "Optional node to ask; default is the cluster-wide status"}}, "required": []}}),
         ]
     }
 
@@ -1944,7 +1946,8 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or(anyhow::anyhow!("Missing node"))?;
         let o = self.get_client(args)?.get_ceph_osds(n).await?;
-        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&o)? }] }))
+        let r = flatten_ceph_osds(&o)?;
+        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&r)? }] }))
     }
 
     async fn handle_list_ceph_monitors(&self, args: &Value) -> Result<Value> {
@@ -1954,6 +1957,23 @@ impl McpServer {
             .ok_or(anyhow::anyhow!("Missing node"))?;
         let m = self.get_client(args)?.get_ceph_monitors(n).await?;
         Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&m)? }] }))
+    }
+
+    async fn handle_get_ceph_health(&self, args: &Value) -> Result<Value> {
+        let client = self.get_client(args)?;
+        let (s, source) = match args.get("node").and_then(|v| v.as_str()) {
+            Some(n) => (
+                client.get_ceph_status(n).await?,
+                format!("/nodes/{}/ceph/status", n),
+            ),
+            None => (
+                client.get_cluster_ceph_status().await?,
+                "/cluster/ceph/status".to_string(),
+            ),
+        };
+        let mut summary = summarize_ceph_status(&s);
+        summary["source"] = json!(source);
+        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&summary)? }] }))
     }
 
     async fn handle_list_backup_schedules(&self, args: &Value) -> Result<Value> {
@@ -2562,4 +2582,120 @@ impl McpServer {
             .await?;
         Ok(json!({ "content": [{ "type": "text", "text": format!("Ceph pool deleted: {}", u) }] }))
     }
+}
+
+/// Turns the Ceph OSD answer into `{"flags": ..., "osds": [...]}`. Proxmox 9
+/// returns a CRUSH tree (`{flags, root}`); older releases return a plain list.
+pub fn flatten_ceph_osds(v: &Value) -> Result<Value> {
+    fn walk(node: &Value, out: &mut Vec<Value>) {
+        if node.get("type").and_then(|t| t.as_str()) == Some("osd") {
+            out.push(json!({
+                "id": node.get("id"),
+                "name": node.get("name"),
+                "host": node.get("host"),
+                "status": node.get("status"),
+                "in": node.get("in"),
+                "device_class": node.get("device_class"),
+                "crush_weight": node.get("crush_weight"),
+                "percent_used": node.get("percent_used"),
+                "pgs": node.get("pgs"),
+            }));
+        }
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            for c in children {
+                walk(c, out);
+            }
+        }
+    }
+    match v {
+        Value::Object(m) if m.contains_key("root") => {
+            let mut osds = Vec::new();
+            walk(&m["root"], &mut osds);
+            Ok(json!({ "flags": m.get("flags"), "osds": osds }))
+        }
+        Value::Array(_) => Ok(json!({ "flags": null, "osds": v })),
+        other => anyhow::bail!(
+            "Unexpected Ceph OSD answer: expected a tree with \"root\" or a list, got {}",
+            match other {
+                Value::Object(_) => "an object without \"root\"",
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Array(_) => unreachable!(),
+            }
+        ),
+    }
+}
+
+/// Cuts Proxmox's Ceph status (about 120 KB with the mgr module catalogue)
+/// down to the health word, warnings and counts. Missing fields become null.
+pub fn summarize_ceph_status(s: &Value) -> Value {
+    let checks: Vec<Value> = s
+        .pointer("/health/checks")
+        .and_then(|c| c.as_object())
+        .map(|m| {
+            m.iter()
+                .map(|(name, c)| {
+                    json!({
+                        "name": name,
+                        "severity": c.get("severity"),
+                        "summary": c.pointer("/summary/message"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let quorum = s.get("quorum_names").and_then(|q| q.as_array());
+    // Ceph Octopus+ puts the counts directly in osdmap; older ones nest osdmap.osdmap.
+    let osdmap = match s.pointer("/osdmap/osdmap") {
+        Some(inner) => inner,
+        None => s.get("osdmap").unwrap_or(&Value::Null),
+    };
+    let pgmap = s.get("pgmap").unwrap_or(&Value::Null);
+    let by_state: Value = pgmap
+        .get("pgs_by_state")
+        .and_then(|p| p.as_array())
+        .map(|a| {
+            Value::Object(
+                a.iter()
+                    .filter_map(|e| {
+                        Some((
+                            e.get("state_name")?.as_str()?.to_string(),
+                            e.get("count").cloned().unwrap_or(Value::Null),
+                        ))
+                    })
+                    .collect(),
+            )
+        })
+        .unwrap_or(Value::Null);
+    let used = pgmap.get("bytes_used").and_then(|v| v.as_f64());
+    let total = pgmap.get("bytes_total").and_then(|v| v.as_f64());
+    let percent = match (used, total) {
+        (Some(u), Some(t)) if t > 0.0 => json!((u / t * 1000.0).round() / 10.0),
+        _ => Value::Null,
+    };
+    json!({
+        "health": s.pointer("/health/status"),
+        "checks": checks,
+        "monitors": {
+            "quorum": quorum,
+            "count": quorum.map(|q| q.len()),
+        },
+        "osds": {
+            "total": osdmap.get("num_osds"),
+            "up": osdmap.get("num_up_osds"),
+            "in": osdmap.get("num_in_osds"),
+        },
+        "placement_groups": {
+            "total": pgmap.get("num_pgs"),
+            "by_state": by_state,
+        },
+        "usage": {
+            "bytes_used": pgmap.get("bytes_used"),
+            "bytes_total": pgmap.get("bytes_total"),
+            "percent_used": percent,
+        },
+        "source": null,
+    })
 }

@@ -3,6 +3,7 @@ name: Build and Push
 on:
   push:
     branches: [ main ]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -10,7 +11,20 @@ permissions:
   packages: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Same compiler as the Dockerfile's build stage.
+    container: rust:1.99.0-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Test
+        run: cargo test --locked
+
   build-push:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -26,6 +40,12 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Read version
+        id: meta
+        run: |
+          echo "version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+          echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       # The Web Server endpoint is amd64; single-platform keeps the Rust build fast.
       - name: Build and push
         uses: docker/build-push-action@v5
@@ -33,6 +53,9 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/jemplayer82/proxmox-mcp-shared:latest
+          tags: |
+            ghcr.io/jemplayer82/proxmox-mcp-shared:latest
+            ghcr.io/jemplayer82/proxmox-mcp-shared:${{ steps.meta.outputs.version }}
+            ghcr.io/jemplayer82/proxmox-mcp-shared:sha-${{ steps.meta.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
