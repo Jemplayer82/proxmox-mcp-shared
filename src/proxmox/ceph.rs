@@ -11,6 +11,12 @@ impl ProxmoxClient {
         Ok(self.request(Method::GET, &path, None).await?)
     }
 
+    pub async fn get_cluster_ceph_status(&self) -> Result<Value> {
+        Ok(self
+            .request(Method::GET, "cluster/ceph/status", None)
+            .await?)
+    }
+
     // --- Ceph Pools ---
 
     pub async fn get_ceph_pools(&self, node: &str) -> Result<Vec<Value>> {
