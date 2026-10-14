@@ -1944,7 +1944,8 @@ impl McpServer {
             .and_then(|v| v.as_str())
             .ok_or(anyhow::anyhow!("Missing node"))?;
         let o = self.get_client(args)?.get_ceph_osds(n).await?;
-        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&o)? }] }))
+        let r = flatten_ceph_osds(&o)?;
+        Ok(json!({ "content": [{ "type": "text", "text": serde_json::to_string(&r)? }] }))
     }
 
     async fn handle_list_ceph_monitors(&self, args: &Value) -> Result<Value> {
@@ -2561,5 +2562,49 @@ impl McpServer {
             )
             .await?;
         Ok(json!({ "content": [{ "type": "text", "text": format!("Ceph pool deleted: {}", u) }] }))
+    }
+}
+
+/// Turns the Ceph OSD answer into `{"flags": ..., "osds": [...]}`. Proxmox 9
+/// returns a CRUSH tree (`{flags, root}`); older releases return a plain list.
+pub fn flatten_ceph_osds(v: &Value) -> Result<Value> {
+    fn walk(node: &Value, out: &mut Vec<Value>) {
+        if node.get("type").and_then(|t| t.as_str()) == Some("osd") {
+            out.push(json!({
+                "id": node.get("id"),
+                "name": node.get("name"),
+                "host": node.get("host"),
+                "status": node.get("status"),
+                "in": node.get("in"),
+                "device_class": node.get("device_class"),
+                "crush_weight": node.get("crush_weight"),
+                "percent_used": node.get("percent_used"),
+                "pgs": node.get("pgs"),
+            }));
+        }
+        if let Some(children) = node.get("children").and_then(|c| c.as_array()) {
+            for c in children {
+                walk(c, out);
+            }
+        }
+    }
+    match v {
+        Value::Object(m) if m.contains_key("root") => {
+            let mut osds = Vec::new();
+            walk(&m["root"], &mut osds);
+            Ok(json!({ "flags": m.get("flags"), "osds": osds }))
+        }
+        Value::Array(_) => Ok(json!({ "flags": null, "osds": v })),
+        other => anyhow::bail!(
+            "Unexpected Ceph OSD answer: expected a tree with \"root\" or a list, got {}",
+            match other {
+                Value::Object(_) => "an object without \"root\"",
+                Value::Null => "null",
+                Value::Bool(_) => "a boolean",
+                Value::Number(_) => "a number",
+                Value::String(_) => "a string",
+                Value::Array(_) => unreachable!(),
+            }
+        ),
     }
 }
